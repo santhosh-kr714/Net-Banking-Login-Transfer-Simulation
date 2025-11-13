@@ -1,0 +1,517 @@
+User.java
+package com.netbanking;
+public class User {
+    private int id;
+    private String username;
+    private String fullname;
+    public User(int id, String username, String fullname) {
+        this.id = id;
+        this.username = username;
+        this.fullname = fullname;
+    }
+    public int getId(){ return id; }
+    public String getUsername(){ return username; }
+    public String getFullname(){ return fullname; }
+}
+DBUtil.java
+package com.netbanking;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+public class DBUtil {
+    private static final String URL = "jdbc:mysql://localhost:3306/netbank_db?useSSL=false&serverTimezone=UTC";
+    private static final String USER = "root";
+    private static final String PASS = "your_mysql_password_here"; // <-- set your password
+
+    public static Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(URL, USER, PASS);
+    }
+}
+Account.java
+package com.netbanking;
+import java.math.BigDecimal;
+public class Account {
+    private int id;
+    private int userId;
+    private String accountNo;
+    private BigDecimal balance;
+    public Account(int id, int userId, String accountNo, BigDecimal balance) {
+        this.id = id; this.userId = userId; this.accountNo = accountNo; this.balance = balance;
+    }
+    public int getId(){ return id; }
+    public int getUserId(){ return userId; }
+    public String getAccountNo(){ return accountNo; }
+    public BigDecimal getBalance(){ return balance; }
+}
+AuthDAO.java
+package com.netbanking;
+import java.sql.*;
+public class AuthDAO {
+    public User authenticate(String username, String password) {
+        String sql = "SELECT id, username, fullname FROM users WHERE username=? AND password=?";
+        try (Connection con = DBUtil.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setString(1, username);
+            ps.setString(2, password);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new User(rs.getInt("id"), rs.getString("username"), rs.getString("fullname"));
+                }
+            }
+        } catch (SQLException ex) { ex.printStackTrace(); }
+        return null;
+    }
+    public Account getAccountByUserId(int userId){
+        String sql = "SELECT id, user_id, account_no, balance FROM accounts WHERE user_id=?";
+        try (Connection con = DBUtil.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setInt(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new Account(rs.getInt("id"), rs.getInt("user_id"), rs.getString("account_no"), rs.getBigDecimal("balance"));
+                }
+            }
+        } catch (SQLException ex) { ex.printStackTrace(); }
+        return null;
+    }
+    public Account getAccountByAccountNo(String accNo){
+        String sql = "SELECT id, user_id, account_no, balance FROM accounts WHERE account_no=?";
+        try (Connection con = DBUtil.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setString(1, accNo);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new Account(rs.getInt("id"), rs.getInt("user_id"), rs.getString("account_no"), rs.getBigDecimal("balance"));
+                }
+            }
+        } catch (SQLException ex) { ex.printStackTrace(); }
+        return null;
+    }
+}
+TransactionDAO.java
+package com.netbanking;
+
+import java.sql.*;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+public class TransactionDAO {
+    public boolean transferFunds(String fromAcc, String toAcc, BigDecimal amount, String remarks) throws SQLException {
+        String selectForUpdate = "SELECT id, balance FROM accounts WHERE account_no = ? FOR UPDATE";
+        String updateBalance = "UPDATE accounts SET balance = ? WHERE id = ?";
+        String insertTx = "INSERT INTO transactions (from_account, to_account, amount, remarks) VALUES (?, ?, ?, ?)";
+        try (Connection con = DBUtil.getConnection()) {
+            try {
+                con.setAutoCommit(false);
+                // lock source
+                int fromId; BigDecimal fromBal;
+                try (PreparedStatement ps = con.prepareStatement(selectForUpdate)) {
+                    ps.setString(1, fromAcc);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) throw new SQLException("Source account not found");
+                        fromId = rs.getInt("id");
+                        fromBal = rs.getBigDecimal("balance");
+                    }
+                }
+
+                // lock target
+                int toId; BigDecimal toBal;
+                try (PreparedStatement ps = con.prepareStatement(selectForUpdate)) {
+                    ps.setString(1, toAcc);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) throw new SQLException("Target account not found");
+                        toId = rs.getInt("id");
+                        toBal = rs.getBigDecimal("balance");
+                    }
+                }
+                if (fromBal.compareTo(amount) < 0) throw new SQLException("Insufficient funds");
+                BigDecimal newFrom = fromBal.subtract(amount);
+                BigDecimal newTo = toBal.add(amount);
+                try (PreparedStatement ps = con.prepareStatement(updateBalance)) {
+                    ps.setBigDecimal(1, newFrom);
+                    ps.setInt(2, fromId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = con.prepareStatement(updateBalance)) {
+                    ps.setBigDecimal(1, newTo);
+                    ps.setInt(2, toId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = con.prepareStatement(insertTx)) {
+                    ps.setString(1, fromAcc);
+                    ps.setString(2, toAcc);
+                    ps.setBigDecimal(3, amount);
+                    ps.setString(4, remarks);
+                    ps.executeUpdate();
+                }
+                con.commit();
+                return true;
+            } catch (SQLException ex) {
+                con.rollback();
+                throw ex;
+            } finally {
+                con.setAutoCommit(true);
+            }
+        }
+    }
+    public List<String> getRecentTransactions(String accountNo, int limit) {
+        List<String> list = new ArrayList<>();
+        String sql = "SELECT from_account, to_account, amount, tx_date, remarks FROM transactions WHERE from_account=? OR to_account=? ORDER BY tx_date DESC LIMIT ?";
+        try (Connection con = DBUtil.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+            ps.setString(1, accountNo);
+            ps.setString(2, accountNo);
+            ps.setInt(3, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String from = rs.getString("from_account");
+                    String to = rs.getString("to_account");
+                    String amt = rs.getBigDecimal("amount").toPlainString();
+                    String date = rs.getString("tx_date");
+                    String rem = rs.getString("remarks");
+                    list.add(date + " | " + from + " -> " + to + " : " + amt + " (" + rem + ")");
+                }
+            }
+        } catch (SQLException ex) { ex.printStackTrace(); }
+        return list;
+    }
+}
+LoginFrame.java
+package com.netbanking;
+import javax.swing.*;
+import java.awt.*;
+public class LoginFrame extends JFrame {
+    private JTextField userField;
+    private JPasswordField passField;
+    private AuthDAO authDAO = new AuthDAO();
+    public LoginFrame() {
+        setTitle("NetBanking - Login");
+        setSize(520, 320);
+        setLocationRelativeTo(null);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLayout(new BorderLayout())
+        JPanel top = new JPanel(new BorderLayout());
+        top.setBackground(new Color(12,123,160));
+        JLabel title = new JLabel("<html><span style='color:white;font-size:20px;font-weight:600;'>MyBank NetBanking</span><br><span style='color:white; font-size:11px;'>Secure online banking demo</span></html>");
+        title.setBorder(BorderFactory.createEmptyBorder(10,20,10,10));
+        top.add(title, BorderLayout.WEST);
+        add(top, BorderLayout.NORTH);
+        JPanel form = new JPanel(new GridBagLayout());
+        form.setBorder(BorderFactory.createEmptyBorder(20,40,20,40));
+        GridBagConstraints c = new GridBagConstraints();
+        c.insets = new Insets(8,8,8,8);
+        c.fill = GridBagConstraints.HORIZONTAL;
+        c.gridx=0; c.gridy=0; form.add(new JLabel("Username:"), c);
+        c.gridx=1; userField = new JTextField(18); form.add(userField, c);
+        c.gridx=0; c.gridy=1; form.add(new JLabel("Password:"), c);
+        c.gridx=1; passField = new JPasswordField(18); form.add(passField, c);
+        c.gridx=0; c.gridy=2; c.gridwidth=2;
+        JButton loginBtn = new JButton("Login");
+        form.add(loginBtn, c);
+        add(form, BorderLayout.CENTER);
+        JPanel foot = new JPanel();
+        JLabel help = new JLabel("Demo accounts: ashu/pass123  |  rohit/pwd456");
+        foot.add(help);
+        add(foot, BorderLayout.SOUTH);
+        loginBtn.addActionListener(e -> doLogin());
+    }
+    private void doLogin() {
+        String user = userField.getText().trim();
+        String pass = new String(passField.getPassword());
+        if (user.isEmpty() || pass.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Enter username and password.");
+            return;
+        }
+        User u = authDAO.authenticate(user, pass);
+        if (u == null) {
+            JOptionPane.showMessageDialog(this, "Invalid credentials.");
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            MainFrame main = new MainFrame(u);
+            main.setVisible(true);
+            this.dispose();
+        });
+    }
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new LoginFrame().setVisible(true));
+    }
+}
+MainFrame.java
+package com.netbanking;
+import javax.swing.*;
+import java.awt.*;
+import java.util.List;
+public class MainFrame extends JFrame {
+    private User user;
+    private AuthDAO authDAO = new AuthDAO();
+    private TransactionDAO txDao = new TransactionDAO();
+    private JPanel cards;
+    private CardLayout cardLayout = new CardLayout();
+    private JLabel lblAccNo = new JLabel();
+    private JLabel lblBalance = new JLabel();
+    private JLabel lblName = new JLabel();
+    public MainFrame(User user) {
+        this.user = user;
+        setTitle("MyBank - Dashboard");
+        setSize(1000, 600);
+        setLocationRelativeTo(null);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        initUI();
+        refreshAccountSummary();
+    }
+    private void initUI() {
+        setLayout(new BorderLayout())
+        JPanel leftNav = new JPanel();
+        leftNav.setLayout(new BoxLayout(leftNav, BoxLayout.Y_AXIS));
+        leftNav.setPreferredSize(new Dimension(170, 0));
+        leftNav.setBorder(BorderFactory.createEmptyBorder(10,10,10,10));
+        leftNav.setBackground(new Color(245,247,250));
+
+        lblName.setText("<html><b>" + user.getFullname() + "</b></html>");
+        lblName.setBorder(BorderFactory.createEmptyBorder(6,6,12,6));
+        leftNav.add(lblName);
+        JButton btnHome = new JButton("Home");
+        JButton btnTransfer = new JButton("Transfer");
+        JButton btnHistory = new JButton("Transactions");
+        JButton btnProfile = new JButton("Profile");
+        JButton btnLogout = new JButton("Logout");
+        btnHome.setAlignmentX(Component.CENTER_ALIGNMENT);
+        btnTransfer.setAlignmentX(Component.CENTER_ALIGNMENT);
+        btnHistory.setAlignmentX(Component.CENTER_ALIGNMENT);
+        btnProfile.setAlignmentX(Component.CENTER_ALIGNMENT);
+        btnLogout.setAlignmentX(Component.CENTER_ALIGNMENT);
+        leftNav.add(btnHome); leftNav.add(Box.createVerticalStrut(8));
+        leftNav.add(btnTransfer); leftNav.add(Box.createVerticalStrut(8));
+        leftNav.add(btnHistory); leftNav.add(Box.createVerticalStrut(8));
+        leftNav.add(btnProfile); leftNav.add(Box.createVerticalStrut(20));
+        leftNav.add(Box.createVerticalGlue());
+        leftNav.add(btnLogout);
+        add(leftNav, BorderLayout.WEST)
+        cards = new JPanel(cardLayout);
+        cards.add(createHomePanel(), "HOME");
+        cards.add(new TransferPanel(user, this), "TRANSFER");
+        cards.add(new HistoryPanel(user), "HISTORY");
+        cards.add(new ProfilePanel(user), "PROFILE");
+        add(cards, BorderLayout.CENTER);
+        JPanel right = new JPanel(new GridBagLayout());
+        right.setPreferredSize(new Dimension(260, 0));
+        right.setBorder(BorderFactory.createEmptyBorder(20,12,20,12));
+        right.setBackground(new Color(250,250,255));
+        GridBagConstraints c = new GridBagConstraints();
+        c.insets = new Insets(8,8,8,8);
+        c.gridx=0; c.gridy=0;
+        right.add(new JLabel("<html><b>Account Summary</b></html>"), c);
+        c.gridy++;
+        right.add(new JSeparator(SwingConstants.HORIZONTAL), c);
+        c.gridy++;
+        c.anchor = GridBagConstraints.WEST;
+        right.add(new JLabel("Account No:"), c);
+        c.gridy++;
+        right.add(lblAccNo, c);
+        c.gridy++;
+        right.add(new JLabel("Balance:"), c);
+        c.gridy++;
+        lblBalance.setFont(lblBalance.getFont().deriveFont(16f));
+        right.add(lblBalance, c);
+
+        add(right, BorderLayout.EAST);
+        btnHome.addActionListener(e -> showCard("HOME"));
+        btnTransfer.addActionListener(e -> showCard("TRANSFER"));
+        btnHistory.addActionListener(e -> showCard("HISTORY"));
+        btnProfile.addActionListener(e -> showCard("PROFILE"));
+        btnLogout.addActionListener(e -> {
+            this.dispose();
+            SwingUtilities.invokeLater(() -> new LoginFrame().setVisible(true));
+        });
+    }
+    private JPanel createHomePanel() {
+        JPanel p = new JPanel(new BorderLayout());
+        JLabel welcome = new JLabel("<html><h2>Welcome, " + user.getFullname() + "</h2><p>Use the left menu to transfer funds, view transactions or manage profile.</p></html>");
+        p.add(welcome, BorderLayout.NORTH);
+        JTextArea txArea = new JTextArea();
+        txArea.setEditable(false);
+        txArea.setBackground(new Color(250,250,250));
+        JScrollPane sp = new JScrollPane(txArea);
+        sp.setBorder(BorderFactory.createTitledBorder("Recent Transactions"));
+        p.add(sp, BorderLayout.CENTER);
+
+        List<String> recent = txDao.getRecentTransactions(getUserAccountNo(), 10);
+        StringBuilder sb = new StringBuilder();
+        for (String s : recent) sb.append(s).append("\n");
+        txArea.setText(sb.toString());
+        return p;
+    }
+    public void showCard(String name) {
+        refreshAccountSummary();
+        if ("HISTORY".equals(name)) {
+            Component comp = findCard("HISTORY");
+            if (comp instanceof HistoryPanel) ((HistoryPanel) comp).refreshList();
+        }
+        if ("TRANSFER".equals(name)) {
+            Component comp = findCard("TRANSFER");
+            if (comp instanceof TransferPanel) ((TransferPanel) comp).refreshAccountInfo();
+        }
+        cardLayout.show(cards, name);
+    }
+    private Component findCard(String name) {
+        for (Component c : cards.getComponents()) {
+            if (name.equals("HISTORY") && c instanceof HistoryPanel) return c;
+            if (name.equals("TRANSFER") && c instanceof TransferPanel) return c;
+        }
+        return null;
+    }
+
+    public String getUserAccountNo() {
+        Account a = authDAO.getAccountByUserId(user.getId());
+        return a != null ? a.getAccountNo() : "";
+    }
+    public void refreshAccountSummary() {
+        Account a = authDAO.getAccountByUserId(user.getId());
+        if (a != null) {
+            lblAccNo.setText(a.getAccountNo());
+            lblBalance.setText("₹ " + a.getBalance().toPlainString());
+        } else {
+            lblAccNo.setText("-");
+            lblBalance.setText("₹ 0.00");
+        }
+    }
+}
+TransferPanel.java
+package com.netbanking;
+import javax.swing.*;
+import java.awt.*;
+import java.math.BigDecimal;
+public class TransferPanel extends JPanel {
+    private User user;
+    private MainFrame parent;
+    private JTextField fromAccField, toAccField, amountField, remarksField;
+    private JLabel lblFromBal;
+    private TransactionDAO txDao = new TransactionDAO();
+    private AuthDAO authDAO = new AuthDAO();
+    public TransferPanel(User user, MainFrame parent) {
+        this.user = user; this.parent = parent;
+        setName("TRANSFER");
+        setLayout(new BorderLayout());
+        initUI();
+    }
+    private void initUI() {
+        JPanel top = new JPanel(new GridLayout(0,2,8,8));
+        top.setBorder(BorderFactory.createEmptyBorder(10,20,10,20));
+        top.add(new JLabel("From (Account No):"));
+        fromAccField = new JTextField();
+        top.add(fromAccField);
+        top.add(new JLabel("Available Balance:"));
+        lblFromBal = new JLabel();
+        top.add(lblFromBal);
+        top.add(new JLabel("To (Account No):"));
+        toAccField = new JTextField();
+        top.add(toAccField);
+        top.add(new JLabel("Amount (INR):"));
+        amountField = new JTextField();
+        top.add(amountField);
+        top.add(new JLabel("Remarks:"));
+        remarksField = new JTextField();
+        top.add(remarksField);
+        add(top, BorderLayout.CENTER);
+        JPanel btns = new JPanel();
+        JButton transferBtn = new JButton("Transfer Now");
+        btns.add(transferBtn);
+        add(btns, BorderLayout.SOUTH);
+        transferBtn.addActionListener(e -> onTransfer());
+    }
+    public void refreshAccountInfo() {
+        String acc = parent.getUserAccountNo();
+        fromAccField.setText(acc);
+        Account a = authDAO.getAccountByAccountNo(acc);
+        if (a != null) lblFromBal.setText("₹ " + a.getBalance().toPlainString());
+        else lblFromBal.setText("N/A");
+    }
+    private void onTransfer() {
+        String from = fromAccField.getText().trim();
+        String to = toAccField.getText().trim();
+        String amtStr = amountField.getText().trim();
+        String rem = remarksField.getText().trim();
+        if (from.isEmpty() || to.isEmpty() || amtStr.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Please fill from, to and amount.");
+            return;
+        }
+        try {
+            BigDecimal amt = new BigDecimal(amtStr);
+            if (amt.compareTo(BigDecimal.ZERO) <= 0) {
+                JOptionPane.showMessageDialog(this, "Enter a valid amount.");
+                return;
+            }
+            boolean ok = txDao.transferFunds(from, to, amt, rem);
+            if (ok) {
+                JOptionPane.showMessageDialog(this, "Transfer successful.");
+                parent.refreshAccountSummary();
+                refreshAccountInfo();
+            } else {
+                JOptionPane.showMessageDialog(this, "Transfer failed.");
+            }
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Invalid amount.");
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Error: " + ex.getMessage(), "Transfer failed", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+}
+HistoryPanel.java
+package com.netbanking;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.List;
+public class HistoryPanel extends JPanel {
+    private User user;
+    private TransactionDAO txDao = new TransactionDAO();
+    private JList<String> list;
+    public HistoryPanel(User user) {
+        this.user = user;
+        setName("HISTORY");
+        setLayout(new BorderLayout());
+        list = new JList<>(new DefaultListModel<>());
+        add(new JScrollPane(list), BorderLayout.CENTER);
+        setBorder(BorderFactory.createTitledBorder("Transaction History"));
+        refreshList();
+    }
+    public void refreshList() {
+        Account acc = new AuthDAO().getAccountByUserId(user.getId());
+        String accNo = acc != null ? acc.getAccountNo() : "";
+        List<String> recent = txDao.getRecentTransactions(accNo, 100);
+        DefaultListModel<String> m = (DefaultListModel<String>) list.getModel();
+        m.clear();
+        for (String s : recent) m.addElement(s);
+    }
+}
+ProfilePanel.java
+package com.netbanking;
+import javax.swing.*;
+import java.awt.*;
+public class ProfilePanel extends JPanel {
+    private User user;
+    private AuthDAO authDAO = new AuthDAO();
+    public ProfilePanel(User user) {
+        this.user = user;
+        setLayout(new BorderLayout());
+        setBorder(BorderFactory.createTitledBorder("Profile"));
+
+        JPanel form = new JPanel(new GridLayout(0,1,6,6));
+        form.setBorder(BorderFactory.createEmptyBorder(12,12,12,12));
+        form.add(new JLabel("Full name: " + user.getFullname()));
+        Account acc = authDAO.getAccountByUserId(user.getId());
+        form.add(new JLabel("Account No: " + (acc != null ? acc.getAccountNo() : "-")));
+        form.add(new JLabel("Balance: " + (acc != null ? "₹ " + acc.getBalance() : "₹ 0.00")));
+        add(form, BorderLayout.NORTH);
+    }
+}
+AppMain.java
+package com.netbanking;
+import javax.swing.*;
+public class AppMain {
+    public static void main(String[] args) {
+        javax.swing.SwingUtilities.invokeLater(() -> new LoginFrame().setVisible(true));
+    }
+}
+
